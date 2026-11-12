@@ -1,0 +1,783 @@
+#!/usr/bin/env node
+//
+// agents-sync.js（pnpm agents:sync）
+//
+// 用途：项目层与 Worktree 槽位同构配置同步核心引擎。
+//   1. 以主仓 .claude/settings.*.json 端点快照为 SSOT，渲染多 Agent 运行时配置：
+//      - Claude Code: .claude/settings.local.json
+//      - OpenCode: opencode.jsonc
+//      - CodeBuddy: .codebuddy/models.json（WorkBuddy 2026-09-14 全线出清，不再管理）
+//   2. 项目级 MCP 统一驱动（.mcp.json，档位与启停自 agents.config.json 的 mcp 节校准）
+//   3. rules / skills 声明式补链（SSOT: .agents/，根据 AGENTS_REGISTRY 对齐）；
+//      Claude 出厂必管，CodeBuddy/Trae/Codex/Pi 存在即接管（无项目目录不主动 mkdir）
+//   4. 槽位同构扩散广播：若存在多 Git Worktree 槽位，自动发现并全量扩散配置，
+//      并在公网直连场景下随机分配独立 API Key（防工位并发配额争抢）。
+//
+import fs from 'node:fs';
+import path from 'node:path';
+import { execSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import {
+  AGENTS_REGISTRY,
+  MCP_PROFILES,
+  loadMcpState,
+  generateMcpJson,
+  generateAntigravityMcpJson,
+  renderOpenCodeMcp,
+} from './agents-registry.js';
+import { loadAgentsConfig } from './agents-config.js';
+
+const IS_WIN = process.platform === 'win32';
+
+function run(cmd) {
+  return execSync(cmd, { encoding: 'utf-8' }).trim();
+}
+
+function log(msg) {
+  console.log(`[AgentsSync] ${msg}`);
+}
+
+function resolvesTo(linkPath, targetPath) {
+  try {
+    const a = fs.realpathSync(linkPath);
+    const b = fs.realpathSync(targetPath);
+    return IS_WIN ? a.toLowerCase() === b.toLowerCase() : a === b;
+  } catch {
+    return false;
+  }
+}
+
+function ensureLink(linkPath, targetPath) {
+  fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+  let existing = null;
+  try {
+    existing = fs.lstatSync(linkPath);
+  } catch {}
+  if (existing) {
+    if (resolvesTo(linkPath, targetPath)) return;
+    if (existing.isSymbolicLink()) {
+      fs.unlinkSync(linkPath);
+    } else {
+      log(`  ⚠ [Link Warning] 目标 ${linkPath} 为真实目录而非软链，跳过覆盖以保护本地数据`);
+      return;
+    }
+  }
+  fs.symlinkSync(path.resolve(targetPath), linkPath, IS_WIN ? 'junction' : 'dir');
+}
+
+function ensureFileLink(linkPath, targetPath) {
+  fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+  let existing = null;
+  try {
+    existing = fs.lstatSync(linkPath);
+  } catch {}
+  if (existing) {
+    if (resolvesTo(linkPath, targetPath)) return;
+    if (existing.isSymbolicLink()) {
+      fs.unlinkSync(linkPath);
+    } else {
+      log(`  ⚠ [Link Warning] 目标 ${linkPath} 为真实文件而非软链，跳过覆盖以保护本地数据`);
+      return;
+    }
+  }
+  const relTarget = path.relative(path.dirname(linkPath), targetPath);
+  try {
+    fs.symlinkSync(relTarget, linkPath, 'file');
+  } catch {
+    fs.copyFileSync(targetPath, linkPath);
+  }
+}
+
+// 补链矩阵：根据 AGENTS_REGISTRY 动态生成
+const LINK_MAP = {};
+for (const [key, agent] of Object.entries(AGENTS_REGISTRY)) {
+  if (agent.projectDir && agent.projectLinks?.length > 0) {
+    LINK_MAP[agent.projectDir] = agent.projectLinks;
+  }
+}
+// Trae 无配置渲染管线，仅链接层（是否补链受存在性门控约束）
+LINK_MAP['.trae'] = ['rules', 'skills'];
+
+// 存在即接管：Claude 为出厂默认必管；其余 Agent 仅在项目里已有其目录时才补链/渲染，
+// 绝不主动 mkdir——干净项目跑完工具链只留 Claude 痕迹，安装对应 Agent 后下次 sync 自动接管
+const OPTIONAL_AGENT_DIRS = new Set(['.codebuddy', '.trae', '.codex', '.pi']);
+function agentDirActive(wtPath, dir) {
+  return !OPTIONAL_AGENT_DIRS.has(dir) || fs.existsSync(path.join(wtPath, dir));
+}
+
+const KNOWN_AGENT_DIRS = ['.claude', '.codebuddy', '.opencode', '.trae'];
+// 已出清 Agent（omp 2026-08 退出槽位体系）：现役名单不再占位，但历史死链仍巡检回收
+const DEPRECATED_AGENT_DIRS = ['.omp'];
+
+function cleanupStaleLinks(wtPath) {
+  for (const agent of [...KNOWN_AGENT_DIRS, ...DEPRECATED_AGENT_DIRS]) {
+    const keep = LINK_MAP[agent] || [];
+    const agentDir = path.join(wtPath, agent);
+    let entries;
+    try {
+      entries = fs.readdirSync(agentDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (keep.includes(e.name)) continue;
+      const p = path.join(agentDir, e.name);
+      let target;
+      try {
+        target = fs.readlinkSync(p);
+      } catch {
+        continue;
+      }
+      const resolved = path.resolve(agentDir, target);
+      const rulesSrc = path.join(wtPath, '.agents', 'rules');
+      const skillsSrc = path.join(wtPath, '.agents', 'skills');
+      if (resolved === rulesSrc || resolved === skillsSrc) {
+        fs.rmSync(p, { recursive: true, force: true });
+        log(`  ↧ 清理冗余链接 ${agent}/${e.name}（原生读 .agents/ 或死配置）`);
+      }
+    }
+  }
+}
+
+// 运行时密钥变量装配：mcp.keys 声明 变量名→订阅快照名；.machine-state.json 的 slotKey 手工覆盖位优先
+function buildMcpKeys(cfg, mcpState, subscriptions) {
+  const keys = {};
+  for (const [varName, subName] of Object.entries(cfg.mcp.keys || {})) {
+    keys[varName] = subscriptions.find(s => s.name === subName)?.token || '';
+  }
+  if (mcpState.slotKey) keys.slotKey = mcpState.slotKey;
+  return keys;
+}
+
+function shuffleArray(arr) {
+  const res = [...arr];
+  for (let i = res.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [res[i], res[j]] = [res[j], res[i]];
+  }
+  return res;
+}
+
+function loadSlotKeys(rootDir) {
+  // 私仓专属特性：多订阅账号池。agents.config.json 未声明 keyPool（或置 null）即整体禁用；
+  // 池文档缺失/正则无命中同样回落空池，上层自然落回单 Key，不阻断
+  const pool = loadAgentsConfig(rootDir).keyPool;
+  if (!pool?.docPath || !pool?.pattern) return {};
+  const docPath = path.join(rootDir, pool.docPath);
+  const map = {};
+  if (fs.existsSync(docPath)) {
+    const content = fs.readFileSync(docPath, 'utf-8');
+    const matches = content.matchAll(new RegExp(pool.pattern, 'g'));
+    for (const m of matches) {
+      map[m[1]] = m[2];
+    }
+  }
+  return map;
+}
+
+// 订阅接入方式已数据化至 agents.config.json 的 providers 节（npm/headers 缺省
+// '@ai-sdk/anthropic' + anthropic-version 头；urlSuffix=OpenCode 端点后缀，cbUrlSuffix=CodeBuddy 覆盖）。
+// OpenCode 渲染为 V2 原生形状：npm → package（AI SDK 包加 aisdk: 前缀），options.baseURL/apiKey → settings。
+const MODEL_LIMITS = {
+  'max':           { context: 1000000, output: 131072 },
+  'pro':           { context: 1000000, output: 131072 },
+  'flash':         { context: 1000000, output: 131072 },
+};
+const UNKNOWN_LIMIT = { context: 1000000, output: 131072 };
+
+function loadSubscriptions(rootDir, cfg = null) {
+  const config = cfg || loadAgentsConfig(rootDir);
+  const claudeDir = path.join(rootDir, '.claude');
+  const providers = config.providers || {};
+  const customLimits = config.modelLimits || {};
+  const limits = { ...MODEL_LIMITS, ...customLimits };
+  const subs = [];
+  const unknownModels = new Set();
+  for (const file of fs.readdirSync(claudeDir)) {
+    if (!file.startsWith('settings.') || !file.endsWith('.json')) continue;
+    const name = file.slice('settings.'.length, -'.json'.length);
+    if (!name || name === 'local' || name.endsWith('.secrets') || name.includes('example') || name.includes('sample')) continue; // .secrets 为个人密钥层非独立订阅；example/sample 为模板不入分发
+    const providerName = name.replaceAll('.', '-');
+    // 拷入即生效：未在 providers 登记的快照按默认接入形状自动纳入分发（消掉「拷了却静默休眠」footgun）；
+    // 显式登记可覆盖默认（urlSuffix / cbUrlSuffix / keyPlaceholder / npm / headers）。
+    const access = providers[name] || {};
+    if (!providers[name]) {
+      log(`  ℹ 订阅 [${name}] 未在 providers 登记，按默认接入形状自动纳入（需自定义 urlSuffix/npm/占位符时再登记）`);
+    }
+    let env;
+    try {
+      env = JSON.parse(fs.readFileSync(path.join(claudeDir, file), 'utf-8')).env;
+      // multi 档双层：tracked 无 key 结构 ⊕ 个人 secrets（settings.<name>.secrets.json 仅 token 字段）；
+      // 本仓单层快照模式无 secrets 文件，此处为 no-op
+      const secretsPath = path.join(claudeDir, `settings.${name}.secrets.json`);
+      if (fs.existsSync(secretsPath)) {
+        try {
+          const secretsEnv = JSON.parse(fs.readFileSync(secretsPath, 'utf-8')).env;
+          if (secretsEnv) env = { ...env, ...secretsEnv };
+        } catch (e) {
+          log(`  ⚠ 订阅 [${name}] secrets 文件解析失败，忽略：${e.message}`);
+        }
+      }
+    } catch (e) {
+      log(`  ⚠ 订阅 [${name}] 快照解析失败，跳过：${e.message}`);
+      continue;
+    }
+    const token = env.ANTHROPIC_AUTH_TOKEN;
+    const baseURL = env.ANTHROPIC_BASE_URL;
+    if (!token || !baseURL) {
+      log(`  ⚠ 订阅 [${name}] 缺 token/baseURL，跳过`);
+      continue;
+    }
+
+    const stripWin = id => (id || '').replace(/\[1m\]$/i, '');
+    const slotKeys = ['ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL'];
+    const models = [];
+    for (const k of slotKeys) {
+      const id = stripWin(env[k]);
+      if (id && !models.some(m => m.id === id)) {
+        if (!limits[id]) unknownModels.add(id);
+        models.push({ id, limit: limits[id] || UNKNOWN_LIMIT, known: !!limits[id] });
+      }
+    }
+    subs.push({
+      name,
+      providerName,
+      npm: access.npm || '@ai-sdk/anthropic',
+      headers: access.headers || { 'anthropic-version': '2023-06-01' },
+      // ?? 而非 ||：urlSuffix/cbUrlSuffix 合法值含空串 ''（baseURL 已含版本段时直接复用），falsy 短路会拿不到。
+      // 默认 ''：快照 baseURL 是 Claude Code 原样使用的完整端点（多含 /v1），默认不拼接；需拼接时显式登记
+      urlSuffix: access.urlSuffix ?? '',
+      cbUrlSuffix: access.cbUrlSuffix ?? null,
+      keyPlaceholder: access.keyPlaceholder || null,
+      token, baseURL, models,
+      slots: {
+        haiku: env.ANTHROPIC_DEFAULT_HAIKU_MODEL,
+        sonnet: env.ANTHROPIC_DEFAULT_SONNET_MODEL,
+        opus: env.ANTHROPIC_DEFAULT_OPUS_MODEL,
+      },
+      slotsBase: {
+        haiku: stripWin(env.ANTHROPIC_DEFAULT_HAIKU_MODEL),
+        sonnet: stripWin(env.ANTHROPIC_DEFAULT_SONNET_MODEL),
+        opus: stripWin(env.ANTHROPIC_DEFAULT_OPUS_MODEL),
+      },
+    });
+  }
+  for (const m of unknownModels) log(`  ℹ 模型 [${m}] 未在 modelLimits 登记，默认按 1M 上下文规格注入（可于 agents.config.json#modelLimits 定制）`);
+  return subs;
+}
+
+function buildLocalFromSnapshot(sub) {
+  return {
+    hasCompletedOnboarding: true,
+    env: {
+      ANTHROPIC_AUTH_TOKEN: sub.token,
+      ANTHROPIC_BASE_URL: sub.baseURL,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: sub.slots.haiku,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: sub.slots.sonnet,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: sub.slots.opus,
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      CLAUDE_CODE_AUTO_MODE_SERVER: '0',
+      API_TIMEOUT_MS: '600000',
+    },
+    model: 'sonnet',
+    effortLevel: 'high',
+  };
+}
+
+const MCP_FILE_LINKS = ['.trae/mcp.json'];
+const STALE_MCP_LINKS = ['.codebuddy/mcp.json', '.omp/mcp.json'];
+
+function syncMcpConfigs(wt, state, keys, mcpCfg) {
+  const regTotal = Object.keys(MCP_PROFILES[state.profile] || MCP_PROFILES[mcpCfg?.defaultProfile] || {}).length;
+  const missing = (mcpCfg?.requiredKeys?.[state.profile] || []).filter((v) => !keys[v]);
+  if (missing.length > 0) {
+    log(`  ⚠ 档位 [${state.profile}] 缺密钥变量 ${missing.join('/')}（订阅快照与状态文件均未提供），跳过 MCP 同步`);
+    return { allServers: {}, regDisabled: [] };
+  }
+
+  const mcpJsonPath = path.join(wt.path, '.mcp.json');
+  const mcpData = generateMcpJson(state, keys);
+  // 保留注册表外的既有 server（项目/用户原有或手加的外挂 MCP）：注册表托管的以本次渲染为准，
+  // 非托管条目原样留存并作为项目通用 MCP 向其他 Agent（OpenCode / Antigravity 等）全量广播扩散。
+  const managedNames = new Set(Object.keys(MCP_PROFILES[state.profile] || MCP_PROFILES[mcpCfg?.defaultProfile] || {}));
+  let preserved = 0;
+  if (fs.existsSync(mcpJsonPath)) {
+    try {
+      const prev = JSON.parse(fs.readFileSync(mcpJsonPath, 'utf-8'));
+      for (const [name, cfg] of Object.entries(prev.mcpServers || {})) {
+        if (!managedNames.has(name) && !(name in mcpData.mcpServers)) {
+          mcpData.mcpServers[name] = cfg;
+          preserved++;
+        }
+      }
+    } catch { /* 旧文件损坏：按纯注册表渲染，不做保留 */ }
+  }
+  const mcpContent = JSON.stringify(mcpData, null, 2) + '\n';
+  const oldContent = fs.existsSync(mcpJsonPath) ? fs.readFileSync(mcpJsonPath, 'utf-8') : '';
+  if (oldContent !== mcpContent) {
+    fs.writeFileSync(mcpJsonPath, mcpContent, 'utf-8');
+  }
+  if (preserved > 0) {
+    log(`  ↺ 聚合注册表外 MCP server ${preserved} 个，向全系 Agent 扩散`);
+  }
+
+  for (const rel of MCP_FILE_LINKS) {
+    if (!agentDirActive(wt.path, path.dirname(rel))) continue;
+    ensureFileLink(path.join(wt.path, rel), mcpJsonPath);
+  }
+
+  // 同步 Antigravity (AGY) 项目级 MCP 配置（唯一标准位：.agents/mcp_config.json）
+  const agyAgentsDir = path.join(wt.path, '.agents');
+  if (fs.existsSync(agyAgentsDir)) {
+    const standardAgyMcp = path.join(agyAgentsDir, 'mcp_config.json');
+    const agyData = generateAntigravityMcpJson(mcpData.mcpServers, keys);
+    const agyContent = JSON.stringify(agyData, null, 2) + '\n';
+    const oldContent = fs.existsSync(standardAgyMcp) ? fs.readFileSync(standardAgyMcp, 'utf-8') : '';
+    if (oldContent !== agyContent) {
+      fs.writeFileSync(standardAgyMcp, agyContent, 'utf-8');
+      log(`  ✓ Antigravity 项目级配置 [.agents/mcp_config.json] 已对齐渲染（含托管与自定义）`);
+    }
+  }
+
+
+
+  for (const rel of STALE_MCP_LINKS) {
+    const p = path.join(wt.path, rel);
+    try {
+      const resolved = path.resolve(path.dirname(p), fs.readlinkSync(p));
+      if (resolved === mcpJsonPath) {
+        fs.rmSync(p, { force: true });
+        log(`  ↧ 清理死链 ${rel}（该工具原生读根 .mcp.json）`);
+      }
+    } catch {}
+  }
+
+  log(`  ✓ MCP 档位 [${state.profile}] 已渲染（有效 ${Object.keys(mcpData.mcpServers).length}/${regTotal + preserved}，同源软链就绪）`);
+  return { allServers: mcpData.mcpServers, regDisabled: state.disabled.filter(n => managedNames.has(n)) };
+}
+
+function renderOpenCodeProviders(subs) {
+  const blocks = [];
+  for (const sub of subs) {
+    const models = sub.models.map(m =>
+      `        "${m.id}": {\n` +
+      `          "name": "${m.id} (${sub.name})",\n` +
+      `          "limit": {\n            "context": ${m.limit.context},\n            "output": ${m.limit.output}\n          }\n        }`
+    ).join(',\n');
+    const token = sub.keyPlaceholder ? `{{${sub.keyPlaceholder}}}` : sub.token;
+    const url = sub.baseURL.replace(/\/$/, '') + sub.urlSuffix;
+    const headers = Object.entries({ Authorization: `Bearer ${token}`, ...sub.headers })
+      .map(([k, v]) => `"${k}": "${v}"`).join(',\n            ');
+    blocks.push(
+      `    // 订阅 ${sub.name}（自动生成自 .claude/settings.${sub.name}.json，勿手改）\n` +
+      `    "${sub.providerName}": {\n` +
+      `      "package": "aisdk:${sub.npm}",\n` +
+      `      "name": "${sub.name}",\n` +
+      `      "settings": {\n` +
+      `        "baseURL": "${url}",\n` +
+      `        "apiKey": "${token}"\n` +
+      `      },\n` +
+      `      "headers": {\n            ${headers}\n      },\n` +
+      `      "models": {\n${models}\n      }\n` +
+      `    }`
+    );
+  }
+  return blocks.join(',\n') + ',\n';
+}
+
+function renderCodeBuddyModels(subs) {
+  const idCount = new Map();
+  for (const sub of subs) for (const m of sub.models) idCount.set(m.id, (idCount.get(m.id) || 0) + 1);
+  const entries = [];
+  for (const sub of subs) {
+    const apiKey = sub.keyPlaceholder ? `{{${sub.keyPlaceholder}}}` : sub.token;
+    // ?? 而非 ||：cbUrlSuffix 合法值含空串 ''（baseURL 已含 /v1 时直接复用）
+    const url = sub.baseURL.replace(/\/$/, '') + (sub.cbUrlSuffix ?? sub.urlSuffix);
+    for (const m of sub.models) {
+      const modelId = idCount.get(m.id) > 1 ? `${m.id}@${sub.name}` : m.id;
+      entries.push(
+        `    {\n` +
+        `      "id": "${modelId}",\n` +
+        `      "name": "${m.id} (${sub.name})",\n` +
+        `      "vendor": "user",\n` +
+        `      "url": "${url}",\n` +
+        `      "apiKey": "${apiKey}",\n` +
+        `      "supportsToolCall": true,\n` +
+        `      "supportsImages": false,\n` +
+        `    }`
+      );
+    }
+  }
+  return entries.join(',\n') + ',\n';
+}
+
+const DEFAULT_OPENCODE_MODEL = 'opencode/deepseek-v4-flash-free';
+
+function extractExistingModel(targetPath) {
+  if (!fs.existsSync(targetPath)) return null;
+  try {
+    const raw = fs.readFileSync(targetPath, 'utf-8');
+    const m = raw.match(/"model"\s*:\s*"([^"]+)"/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function syncOpenCodeConfig(wt, rootDir, subs, slotKey, allServers, mcpState, mcpKeys, cfg) {
+  const tplPath = path.join(rootDir, 'opencode.template.jsonc');
+  const targetPath = path.join(wt.path, 'opencode.jsonc');
+  const legacyJson = path.join(wt.path, 'opencode.json');
+
+  if (fs.existsSync(legacyJson)) {
+    try { fs.rmSync(legacyJson, { force: true }); } catch {}
+  }
+  if (!fs.existsSync(tplPath)) return;
+
+  const primary = subs.find(s => s.name === cfg.defaultSubscription) || subs[0];
+
+  // 模型解析与就地保留：
+  // 1. cfg.opencodeModel 显式配置优先；
+  // 2. 本地既有 opencode.jsonc 已选模型就地保留（不暴力覆盖）；
+  // 3. 兜底回落 OpenCode 官方 Free 模型（opencode/deepseek-v4-flash-free，不消耗付费配额）
+  let model = DEFAULT_OPENCODE_MODEL;
+  const existingModel = extractExistingModel(targetPath);
+  if (cfg.opencodeModel) {
+    model = cfg.opencodeModel;
+  } else if (existingModel) {
+    const legacySubModel = primary ? `${primary.providerName}/${primary.slotsBase.sonnet}` : null;
+    // 若既有配置仍是旧版本强制绑定的快照默认值（如旧版自动注入的订阅模型），升级重置为 Free；
+    // 其余情况（包含用户后续主动切换的付费模型或自定义模型）一律就地保留
+    if (existingModel !== legacySubModel) {
+      model = existingModel;
+    }
+  }
+
+  const smallModel = (primary && primary.slotsBase && primary.slotsBase.haiku)
+    ? `${primary.providerName}/${primary.slotsBase.haiku}`
+    : DEFAULT_OPENCODE_MODEL;
+
+  let rendered = fs.readFileSync(tplPath, 'utf-8');
+  const vars = {
+    '{{SUBSCRIPTION_PROVIDERS}}': renderOpenCodeProviders(subs),
+    '{{OPENCODE_MODEL}}': model,
+    '{{OPENCODE_SMALL_MODEL_REF}}': smallModel,
+    '{{MCP_OPENCODE_BLOCK}}': renderOpenCodeMcp(allServers || mcpState, mcpKeys),
+  };
+  for (const [k, v] of Object.entries(vars)) rendered = rendered.replaceAll(k, v);
+  if (slotKey) rendered = rendered.replaceAll('{{SUB_KEY}}', slotKey);
+
+  const existing = fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf-8') : '';
+  if (existing !== rendered) fs.writeFileSync(targetPath, rendered, 'utf-8');
+  log(`  ✓ OpenCode 配置 opencode.jsonc 已就绪（模型 [${model}]，公网直连绑定 ${slotKey ? '槽位专属' : '默认'} Key）`);
+}
+
+// Codex 项目级 .codex/config.toml 渲染：仅含 [mcp_servers.*] 段（provider/model 由 user-level ~/.codex/config.toml 提供）
+// Codex 协议：project-scoped config 不得 override model_provider/model_providers/profile/auth 等机器本地键，只允许 [mcp_servers.*] 等应用层段
+// 与 user-level 合并：trust 项目时 Codex 自动合并；不 trust 则仅 user-level 生效
+function renderCodexMcpToml(allServers) {
+  if (!allServers || Object.keys(allServers).length === 0) return '';
+  const lines = [];
+  for (const [name, cfg] of Object.entries(allServers)) {
+    lines.push(`[mcp_servers.${name}]`);
+    for (const [k, v] of Object.entries(cfg)) {
+      if (k === 'type') continue;
+      // CC .mcp.json schema 的 headers 键 → codex 原生 http_headers（codex 无 headers 键，serde 静默丢弃致 401）
+      const tomlKey = k === 'headers' ? 'http_headers' : k;
+      if (Array.isArray(v)) {
+        lines.push(`${tomlKey} = [${v.map((x) => JSON.stringify(x)).join(', ')}]`);
+      } else if (typeof v === 'object' && v !== null) {
+        const inner = Object.entries(v).map(([ik, iv]) => `${JSON.stringify(ik)} = ${JSON.stringify(iv)}`).join(', ');
+        lines.push(`${tomlKey} = { ${inner} }`);
+      } else {
+        lines.push(`${tomlKey} = ${JSON.stringify(v)}`);
+      }
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+// 读取护栏自愈（项目层）：blockReadsOutsideWorkingDirectories 为 OR 合并硬拒键，任何一层 true 全机生效
+// （auto 模式 "Block from now on" 误点即写入）；幂等清除项目/槽位 settings 文件中的该键，读取放行由全局层 Read(~/**) 保底
+function stripReadFence(file) {
+  if (!fs.existsSync(file)) return;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    if (cfg.permissions && 'blockReadsOutsideWorkingDirectories' in cfg.permissions) {
+      delete cfg.permissions.blockReadsOutsideWorkingDirectories;
+      fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n', 'utf-8');
+      log(`  ⚠ 已自动解除读取护栏 blockReadsOutsideWorkingDirectories: ${file}`);
+    }
+  } catch (e) {
+    log(`  ⚠ 读取护栏检测跳过（${path.basename(path.dirname(path.dirname(file)))}）: ${e.message}`);
+  }
+}
+
+function syncCodexProjectConfig(wt, allServers) {
+  const targetDir = path.join(wt.path, '.codex');
+  if (!fs.existsSync(targetDir)) return; // 存在即接管：未接入 Codex 不主动建目录
+  const targetFile = path.join(targetDir, 'config.toml');
+
+  const header = `# Codex CLI 项目级配置（pnpm agents:sync 渲染，源：项目 MCP profiles）\n# 仅含 [mcp_servers.*] 段；provider/model/profile 等由 user-level 配置提供\n`;
+  const mcpBlock = renderCodexMcpToml(allServers);
+  const content = header + '\n' + mcpBlock;
+  const existing = fs.existsSync(targetFile) ? fs.readFileSync(targetFile, 'utf-8') : '';
+  if (existing !== content) {
+    fs.writeFileSync(targetFile, content, 'utf-8');
+    log(`  ✓ Codex 项目级 .codex/config.toml 已渲染（${Object.keys(allServers || {}).length} MCP servers）: ${targetFile}`);
+  }
+}
+
+function syncPiProjectConfig(wt, rootDir, subs, cfg) {
+  const targetDir = path.join(wt.path, '.pi');
+  if (!fs.existsSync(targetDir)) return; // 存在即接管：未接入 Pi 不主动建目录
+  const targetFile = path.join(targetDir, 'settings.json');
+
+  let existing = {};
+  if (fs.existsSync(targetFile)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(targetFile, 'utf-8'));
+    } catch {
+      existing = {};
+    }
+  }
+
+  // pi 项目级默认 = 默认订阅快照的首个对话模型（跳过 VL/haiku 槽位，剥 [1m] 窗口后缀）；
+  // defaultProvider/defaultModel 任一缺失才初始化，已配置即就地保留用户自选
+  const defaultSub = subs.find((s) => s.name === cfg.defaultSubscription) || subs[0];
+  if (!defaultSub) return;
+  const primary =
+    defaultSub.models.find((m) => !m.id.toLowerCase().includes('vl') && !m.id.toLowerCase().includes('haiku')) ||
+    defaultSub.models[0];
+  if (!primary) return;
+
+  if (!existing.defaultProvider || !existing.defaultModel) {
+    existing.defaultProvider = defaultSub.providerName;
+    existing.defaultModel = (primary.id || '').replace(/\[1m\]$/i, '');
+    fs.writeFileSync(targetFile, `${JSON.stringify(existing, null, 2)}\n`, 'utf-8');
+    log(`  ✓ Pi 项目级配置已对齐默认订阅模型（${existing.defaultProvider}/${existing.defaultModel}）: ${targetFile}`);
+  }
+}
+
+function syncCodeBuddyModels(wt, rootDir, subs, slotKey) {
+  const tplPath = path.join(rootDir, '.codebuddy', 'models.template.json');
+  const targetPath = path.join(wt.path, '.codebuddy', 'models.json');
+  if (!fs.existsSync(tplPath)) return;
+  if (!fs.existsSync(path.join(wt.path, '.codebuddy'))) return; // 存在即接管：槽位未接入 CodeBuddy 不主动建目录
+
+  let rendered = fs.readFileSync(tplPath, 'utf-8').replace(/^\s*\/\/.*$/gm, '');
+  rendered = rendered.replaceAll('{{SUBSCRIPTION_MODELS}}', renderCodeBuddyModels(subs));
+  if (slotKey) rendered = rendered.replaceAll('{{SUB_KEY}}', slotKey);
+  const jsonOnly = rendered.replace(/,(\s*[}\]])/g, '$1');
+
+  const existing = fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf-8') : '';
+  if (existing !== jsonOnly) {
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, jsonOnly, 'utf-8');
+  }
+  log(`  ✓ CodeBuddy 模型池 models.json 已就绪（公网直连绑定 ${slotKey ? '槽位专属' : '默认'} Key）`);
+}
+
+function listWorktrees(defaultRoot) {
+  try {
+    const raw = run('git worktree list --porcelain');
+    const out = [];
+    let cur = {};
+    const flush = () => {
+      if (cur.path) out.push({ ...cur });
+      cur = {};
+    };
+    for (const line of raw.split('\n')) {
+      if (line.startsWith('worktree ')) {
+        flush();
+        cur.path = line.slice('worktree '.length).trim();
+      } else if (line.startsWith('branch ')) {
+        cur.branch = line.replace('branch refs/heads/', '').trim();
+      }
+    }
+    flush();
+    return out.length > 0 ? out : [{ path: defaultRoot, branch: 'master' }];
+  } catch {
+    // 非 Git Worktree 环境（普通单仓）
+    return [{ path: defaultRoot, branch: 'master' }];
+  }
+}
+
+function main() {
+  const cwd = process.cwd();
+  const worktrees = listWorktrees(cwd);
+  const rootDir = worktrees.find(w => !w.branch || w.branch === 'master')?.path || worktrees[0].path;
+
+  log(`以主工作区 [${rootDir}] 为母本启动项目层与槽位同构扩散同步...`);
+
+  const cfg = loadAgentsConfig(rootDir);
+  const slotKeyMap = loadSlotKeys(rootDir);
+  const subscriptions = loadSubscriptions(rootDir, cfg);
+  const hasSubs = subscriptions.length > 0;
+  if (hasSubs) {
+    log(`订阅快照解析：${subscriptions.map(s => s.name).join(', ')}`);
+  } else {
+    log('⚠ 未解析到任何订阅快照（settings.*.json），降级为仅补链模式（多人库照 *.sample 建快照后重跑）');
+  }
+
+  const mcpState = loadMcpState(rootDir);
+  const mcpKeys = buildMcpKeys(cfg, mcpState, subscriptions);
+  log(`MCP 档位：${mcpState.profile}（禁用：${mcpState.disabled.join('/') || '无'}）`);
+
+  log(`检测到 ${worktrees.length} 个工作区槽位:`);
+  for (const wt of worktrees) log(`  - ${wt.path}${wt.branch ? ` (${wt.branch})` : ''}`);
+  console.log('');
+
+  const availableAccounts = shuffleArray(Object.keys(slotKeyMap));
+  if (availableAccounts.length === 0) {
+    log('⚠ 订阅账号池为空，跳过槽位专属 Key 注入');
+  }
+
+  for (let i = 0; i < worktrees.length; i++) {
+    const wt = worktrees[i];
+    log(`➜ 正在补链与广播配置: ${wt.path}`);
+    const agentsRoot = path.join(wt.path, '.agents');
+    if (!fs.existsSync(path.join(agentsRoot, 'rules')) && !fs.existsSync(path.join(agentsRoot, 'skills'))) {
+      log('  ⚠ 缺少 .agents/ SSOT（rules/skills），跳过本槽位，先完成基线同步');
+      continue;
+    }
+    // .agents/rules 强制就位（install 建主仓；空目录不入 git，槽位/二次克隆于此自愈），杜绝 rules 死链
+    fs.mkdirSync(path.join(agentsRoot, 'rules'), { recursive: true });
+
+    for (const [dir, subs] of Object.entries(LINK_MAP)) {
+      if (!agentDirActive(wt.path, dir)) continue; // 存在即接管：未安装的可选 Agent 不主动建目录
+      for (const sub of subs) {
+        if (!fs.existsSync(path.join(agentsRoot, sub))) continue; // SSOT 子目录缺失则跳过其链接
+        ensureLink(path.join(wt.path, dir, sub), path.join(agentsRoot, sub));
+      }
+    }
+    cleanupStaleLinks(wt.path);
+    log('  ✓ rules/skills 链接已就绪');
+    if (!hasSubs) {
+      log('  ⚠ 无订阅快照，跳过本槽位配置渲染（仅补链）');
+      continue;
+    }
+
+    const accountName = availableAccounts.length > 0
+      ? availableAccounts[i % availableAccounts.length]
+      : '';
+    const slotSubKey = accountName ? slotKeyMap[accountName] : '';
+
+    const { allServers, regDisabled } = syncMcpConfigs(wt, mcpState, mcpKeys, cfg.mcp);
+
+    const localSettings = path.join(wt.path, '.claude', 'settings.local.json');
+    const snapshotByName = Object.fromEntries(subscriptions.map(s => [s.name, s]));
+    try {
+      let localCfg = fs.existsSync(localSettings)
+        ? JSON.parse(fs.readFileSync(localSettings, 'utf-8'))
+        : null;
+      if (!localCfg) {
+        const defaultSub = snapshotByName[cfg.defaultSubscription];
+        if (defaultSub) {
+          localCfg = buildLocalFromSnapshot(defaultSub);
+          fs.mkdirSync(path.dirname(localSettings), { recursive: true });
+          fs.writeFileSync(localSettings, JSON.stringify(localCfg, null, 2) + '\n', 'utf-8');
+          log(`  ✓ settings.local.json 缺失，已从默认订阅 [${cfg.defaultSubscription}] 快照自愈生成`);
+        }
+      } else {
+        const currentUrl = localCfg.env?.ANTHROPIC_BASE_URL || '';
+        const matched = currentUrl
+          ? subscriptions.find(s => currentUrl.startsWith(s.baseURL.replace(/\/$/, '')))
+          : null;
+        const slotSubName = cfg.mcp.keys?.slotKey || '';
+        const slotMarkers = cfg.mcp.slotUrlMarkers || [];
+        if ((matched && matched.name === slotSubName) || (!matched && slotMarkers.some((m) => currentUrl.includes(m)))) {
+          if (slotSubKey && localCfg.env?.ANTHROPIC_AUTH_TOKEN !== slotSubKey) {
+            localCfg.env.ANTHROPIC_AUTH_TOKEN = slotSubKey;
+            fs.writeFileSync(localSettings, JSON.stringify(localCfg, null, 2) + '\n', 'utf-8');
+            log(`  ✓ settings.local.json 已校准为槽位专属订阅 Key（绑定账号 ${accountName}）`);
+          }
+        } else if (matched || currentUrl === '') {
+          const sub = matched || snapshotByName[cfg.defaultSubscription];
+          const freshEnv = buildLocalFromSnapshot(sub).env;
+          if (JSON.stringify(localCfg.env) !== JSON.stringify(freshEnv)) {
+            localCfg.env = freshEnv;
+            fs.writeFileSync(localSettings, JSON.stringify(localCfg, null, 2) + '\n', 'utf-8');
+            log(`  ✓ settings.local.json env 块已刷新对齐 ${sub.name} 快照（本地 permissions 保留）`);
+          }
+        }
+      }
+    } catch (e) {
+      log(`  ⚠ settings.local.json 校准解析跳过：${e.message}`);
+    }
+
+    const finalDisabled = Array.from(new Set(regDisabled || []));
+    // 存在即接管：项目未接入 CodeBuddy（无 .codebuddy 目录）时不主动建目录、不写启停清单
+    if (fs.existsSync(path.join(wt.path, '.codebuddy'))) {
+      const cbLocalSettings = path.join(wt.path, '.codebuddy', 'settings.local.json');
+      const allServerNames = Object.keys(allServers);
+      let cbLocal = { enabledMcpjsonServers: [], disabledMcpjsonServers: [] };
+      if (fs.existsSync(cbLocalSettings)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(cbLocalSettings, 'utf-8'));
+          cbLocal = {
+            ...parsed,
+            enabledMcpjsonServers: Array.isArray(parsed.enabledMcpjsonServers) ? parsed.enabledMcpjsonServers : [],
+            disabledMcpjsonServers: Array.isArray(parsed.disabledMcpjsonServers) ? parsed.disabledMcpjsonServers : [],
+          };
+        } catch (e) {
+          log(`  ⚠ CodeBuddy settings.local.json 解析失败，重建启停清单：${e.message}`);
+        }
+      }
+      const newEnabled = Array.from(new Set(allServerNames));
+      const newDisabled = finalDisabled;
+      if (JSON.stringify(cbLocal.enabledMcpjsonServers) !== JSON.stringify(newEnabled) ||
+          JSON.stringify(cbLocal.disabledMcpjsonServers) !== JSON.stringify(newDisabled)) {
+        cbLocal.enabledMcpjsonServers = newEnabled;
+        cbLocal.disabledMcpjsonServers = newDisabled;
+        fs.mkdirSync(path.dirname(cbLocalSettings), { recursive: true });
+        fs.writeFileSync(cbLocalSettings, JSON.stringify(cbLocal, null, 2) + '\n');
+        log(`  ✓ CodeBuddy MCP 启停清单已校准（enabled: ${newEnabled.join('/') || '无'}；disabled: ${newDisabled.join('/') || '无'}）`);
+      }
+    }
+
+    const ccSettings = path.join(wt.path, '.claude', 'settings.json');
+    try {
+      const ccCfg = JSON.parse(fs.readFileSync(ccSettings, 'utf-8'));
+      if (JSON.stringify(ccCfg.disabledMcpjsonServers || []) !== JSON.stringify(finalDisabled)) {
+        ccCfg.disabledMcpjsonServers = finalDisabled;
+        fs.writeFileSync(ccSettings, JSON.stringify(ccCfg, null, 2) + '\n');
+        log(`  ✓ Claude Code disabledMcpjsonServers 已对齐（${finalDisabled.join('/') || '空'}）`);
+      }
+    } catch (e) {
+      log(`  ⚠ Claude Code settings.json 校准跳过：${e.message}`);
+    }
+
+    stripReadFence(localSettings);
+    stripReadFence(ccSettings);
+
+    syncOpenCodeConfig(wt, rootDir, subscriptions, slotSubKey, allServers, mcpState, mcpKeys, cfg);
+    syncCodeBuddyModels(wt, rootDir, subscriptions, slotSubKey);
+    syncCodexProjectConfig(wt, allServers);
+    syncPiProjectConfig(wt, rootDir, subscriptions, cfg);
+  }
+
+  console.log('');
+  log('🎉 所有项目工作区与 Worktree 槽位的 Agent 链接与同构配置已全量补齐！');
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (err) {
+    console.error(`[AgentsSync Error] ${err.message}`);
+    process.exit(1);
+  }
+}
+
+export {
+  main,
+  listWorktrees,
+  loadSubscriptions,
+  loadSlotKeys,
+  syncMcpConfigs,
+  syncPiProjectConfig,
+  MCP_PROFILES,
+  loadMcpState,
+};

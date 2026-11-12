@@ -1,0 +1,14 @@
+{
+  "name": "say2type",
+  "private": true,
+  "version": "0.0.0",
+  "description": "mac 上的语音转文字输入。ai时代提交工具",
+  "scripts": {
+    "agents:sync": "node scripts/agent/agents-sync.js",
+    "worktree:init": "node scripts/agent/worktree-init.js",
+    "worktree:sync": "node scripts/agent/worktree-sync.js",
+    "model:switch": "node scripts/agent/model-switch.js",
+    "skills:check": "node scripts/agent/skills-update.js --check",
+    "skills:update": "node scripts/agent/skills-update.js --update"
+  }
+}

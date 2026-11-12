@@ -218,3 +218,38 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# say2type 本地配置与运行产物
+/config.toml
+/recordings/
+*.wav
+!.venv/**/*.wav
+
+# >>> agent-toolkit runtime（public 档（公开开源）：密钥防线全开；技能/Claude 权限基线/hook 属作者个人环境不入库；换档重跑本命令，勿手改块内）
+.claude/settings.local.json
+.machine-state.json
+.mcp-state.json
+.agent-toolkit.defaults-snapshot.json
+.agents/plugins/**/mcp_config.json
+opencode.jsonc
+.codebuddy/models.json
+.codebuddy/settings.local.json
+.codex/
+.pi/
+.claude/rules
+.claude/skills
+.codebuddy/rules
+.codebuddy/skills
+.trae/rules
+.trae/skills
+.trae/mcp.json
+node_modules/
+.claude/settings.*.secrets.json
+.claude/settings.*.json
+!.claude/settings.sample.json
+.mcp.json
+.agents/mcp_config.json
+.agents/skills/
+.claude/hooks/
+.claude/settings.json
+# <<< agent-toolkit runtime

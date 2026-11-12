@@ -1,0 +1,14 @@
+{
+  "$comment": "公开个人项目档：最小化——无 MCP 档位、无账号池，只用 worktree 协作与 rules/skills 补链。mainBranch 按本仓实际主分支改为 main。",
+  "mcp": { "defaultProfile": "", "keys": {}, "requiredKeys": {}, "slotUrlMarkers": [], "profiles": {} },
+  "defaultSubscription": "",
+  "keyPool": null,
+  "worktree": {
+    "dirPrefix": {},
+    "residentSlots": [],
+    "collectPaths": [".claude"],
+    "collectSuffix": ".json",
+    "mergeHints": [],
+    "mainBranch": "main"
+  }
+}
