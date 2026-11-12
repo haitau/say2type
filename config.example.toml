@@ -1,0 +1,53 @@
+# say2type 配置示例
+# 用法：cp config.example.toml config.toml 后按需修改。
+# 本地 config.toml 已在 .gitignore 中忽略，不会提交。
+
+[audio]
+# avfoundation 输入设备序号，执行 `say2type devices` 查看。
+# null = 系统默认麦克风；本机示例：1 = 外置麦克风，2 = MacBook Pro 麦克风
+device = 1
+sample_rate = 16000
+channels = 1
+# 单次录音最长秒数（兜底，防止忘记停止）
+max_duration = 30.0
+# 静音自动停止：开口思考时建议先关闭，熟悉后再打开
+silence_stop = false
+silence_db = -40.0
+silence_seconds = 2.0
+# 录音文件保存目录，留空则使用系统临时目录
+output_dir = ""
+
+[asr]
+enabled = true
+# OpenAI 兼容的本地语音识别服务（faster-whisper-server / mlx-omni-server 等）
+# backend = "mock" 时无需任何服务，返回假文本，用于联调流水线
+backend = "openai"
+base_url = "http://localhost:8000/v1"
+model = "whisper-1"
+# zh / en / "" 自动判别
+language = "zh"
+timeout = 60.0
+extra_prompt = ""
+
+[llm]
+enabled = true
+# Ollama 与 oMLX 都暴露 OpenAI 兼容接口；backend = "mock" 时原样透传 ASR 文本
+backend = "openai"
+base_url = "http://localhost:11434/v1"
+# 需先拉取文本模型，例如：ollama pull qwen2.5:7b
+model = "qwen2.5:7b"
+timeout = 60.0
+temperature = 0.1
+max_tokens = 1024
+
+[injector]
+# true = 模拟 Cmd+V 注入当前光标；false = 仅打印结果（调试用）
+enabled = true
+paste_delay = 0.15
+restore_clipboard = true
+restore_delay = 0.3
+
+[rules]
+# 相对于本配置文件所在目录
+system_prompt = "rules/system_prompt.md"
+custom_vocab = "rules/custom_vocab.txt"

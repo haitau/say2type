@@ -1,0 +1,7 @@
+# say2type 运行时零第三方 Python 依赖（仅使用标准库）。
+# 音频采集需要系统级 ffmpeg：
+#   brew install ffmpeg
+#
+# 可选：若希望使用 YAML 格式配置文件 (config.yaml) 而非默认的 config.toml：
+#   pip install PyYAML>=6.0
+PyYAML>=6.0 ; extra == "yaml"

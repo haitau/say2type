@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "say2type"
+version = "0.1.0"
+description = "macOS 纯本地语音输入流水线：本地 ASR + 本地 LLM 润色 + 光标注入"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "shawn" }]
+keywords = ["macos", "asr", "whisper", "ollama", "voice-input", "mlx"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Environment :: Console",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+# 运行时零第三方依赖：tomllib / urllib / subprocess 均为标准库，
+# 音频采集依赖系统中的 ffmpeg (brew install ffmpeg)。
+dependencies = []
+
+[project.optional-dependencies]
+# 仅当你想使用 YAML 格式配置 (config.yaml) 时才需要
+yaml = ["PyYAML>=6.0"]
+dev = ["ruff>=0.6"]
+
+[project.scripts]
+say2type = "say2type.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/say2type"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
