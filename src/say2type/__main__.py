@@ -62,8 +62,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_once.set_defaults(func=cmd_once)
 
     p_record = sub.add_parser("record", parents=[common], help="仅录音，产出 WAV 文件")
-    p_record.add_argument("action", choices=["start", "stop", "foreground"], nargs="?",
-                          default="foreground")
+    p_record.add_argument("action",
+                          choices=["start", "stop", "foreground", "status"],
+                          nargs="?", default="foreground")
     p_record.add_argument("--duration", type=float, help="前台固定录音秒数")
     p_record.set_defaults(func=cmd_record)
 
@@ -133,6 +134,16 @@ def cmd_record(cfg: AppConfig, args: argparse.Namespace) -> int:
         print(state.wav_path)
     elif args.action == "stop":
         print(Recorder.stop_background())
+    elif args.action == "status":
+        from .audio.recorder import BackgroundState
+
+        state = BackgroundState.load()
+        if state is None:
+            print("无进行中的录音")
+            return 0
+        status = "存活" if state.alive() else "进程已退出（状态残留）"
+        print(f"录音中 [{status}] pid={state.pid}")
+        print(f"wav: {state.wav_path}")
     else:
         if args.duration:
             cfg.audio.max_duration = args.duration

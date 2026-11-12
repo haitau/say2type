@@ -59,6 +59,10 @@ class AsrClient:
                 "呃那个，我们今天来说一下 docker 配合 k8s 的部署方式，"
                 "就是说，先写好 dockerfile，然后用 JSON 配置流水线。"
             )
+        if self.cfg.backend == "sherpa":
+            from .sherpa_backend import SherpaAsr
+
+            return SherpaAsr(self.cfg).transcribe(wav_path)
         if self.cfg.backend != "openai":
             raise AsrError(f"未知 ASR backend: {self.cfg.backend}")
         return self._transcribe_openai(wav_path)
@@ -75,12 +79,10 @@ class AsrClient:
             fields["prompt"] = self.cfg.extra_prompt
 
         body, boundary = _build_multipart(fields, "file", wav_path)
-        req = request.Request(
-            url,
-            data=body,
-            method="POST",
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        )
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        if self.cfg.api_key:
+            headers["Authorization"] = f"Bearer {self.cfg.api_key}"
+        req = request.Request(url, data=body, method="POST", headers=headers)
         try:
             with request.urlopen(req, timeout=self.cfg.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))

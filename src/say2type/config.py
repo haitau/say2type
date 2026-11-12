@@ -46,15 +46,23 @@ class AudioConfig:
 @dataclass
 class AsrConfig:
     enabled: bool = True
+    # sherpa: 进程内 sherpa-onnx（默认，复用本地 ONNX 模型）
     # openai: OpenAI 兼容的 /v1/audio/transcriptions 接口；mock: 离线假数据
-    backend: str = "openai"
+    backend: str = "sherpa"
     base_url: str = "http://localhost:8000/v1"
+    api_key: str = ""
     model: str = "whisper-1"
     # zh / en / 留空 "" 让模型自动判别
     language: str = "zh"
     timeout: float = 60.0
     # 传给 ASR 的初始 prompt（帮助识别专有名词），可留空
     extra_prompt: str = ""
+    # ---- sherpa 后端专用 ----
+    # 与 voice-record 共享的 SenseVoice-Small 模型目录
+    sherpa_model_dir: str = "~/.voice-record/models/sherpa-onnx-sense-voice-small"
+    sherpa_num_threads: int = 4
+    # ITN: 逆文本正则化，把“二零二四年”转成“2024 年”等
+    sherpa_use_itn: bool = True
 
 
 @dataclass
@@ -62,8 +70,10 @@ class LlmConfig:
     enabled: bool = True
     # openai: OpenAI 兼容的 /v1/chat/completions（Ollama / oMLX 均兼容）；mock: 原样返回
     backend: str = "openai"
-    base_url: str = "http://localhost:11434/v1"
-    model: str = "qwen2.5:7b"
+    base_url: str = "http://127.0.0.1:8000/v1"
+    # oMLX 等需要 Bearer Token 的服务填这里；Ollama 留空即可
+    api_key: str = ""
+    model: str = "Qwen3-VL-8B-Instruct-4bit"
     timeout: float = 60.0
     temperature: float = 0.1
     max_tokens: int = 1024

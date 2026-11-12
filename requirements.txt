@@ -1,7 +1,12 @@
-# say2type 运行时零第三方 Python 依赖（仅使用标准库）。
-# 音频采集需要系统级 ffmpeg：
-#   brew install ffmpeg
+# say2type 核心运行时零第三方依赖（tomllib / urllib / subprocess 均为标准库）。
 #
-# 可选：若希望使用 YAML 格式配置文件 (config.yaml) 而非默认的 config.toml：
+# 系统级依赖（brew）：
+#   brew install ffmpeg          # avfoundation 麦克风采集
+#
+# 本地 ASR 后端（推荐，复用 ~/.voice-record/models 中的 ONNX 模型）：
+#   pip install -e '.[sherpa]'
+#   即 sherpa-onnx>=2.0（提供 cp311~cp315 的 macOS arm64 预编译轮子）
+#
+# 可选：YAML 格式配置（默认使用标准库 TOML，无需安装）
 #   pip install PyYAML>=6.0
-PyYAML>=6.0 ; extra == "yaml"
+sherpa-onnx>=2.0

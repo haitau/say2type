@@ -1,5 +1,9 @@
-"""零依赖冒烟测试：python3 -m unittest discover -s tests -v"""
+"""冒烟测试：python3 -m unittest discover -s tests -v
 
+sherpa-onnx 相关用例在缺少依赖或模型时自动跳过。
+"""
+
+import importlib.util
 import sys
 import unittest
 from pathlib import Path
@@ -11,13 +15,18 @@ from say2type.asr.client import _build_multipart  # noqa: E402
 from say2type.config import load_config  # noqa: E402
 from say2type.llm.cleaner import build_system_prompt, load_custom_vocab  # noqa: E402
 
+HAS_SHERPA = importlib.util.find_spec("sherpa_onnx") is not None
+SENSE_VOICE_DIR = Path.home() / ".voice-record/models/sherpa-onnx-sense-voice-small"
+
 
 class ConfigTests(unittest.TestCase):
     def test_load_example_config(self) -> None:
         cfg = load_config(ROOT / "config.example.toml")
         self.assertEqual(cfg.audio.sample_rate, 16000)
-        self.assertEqual(cfg.asr.backend, "openai")
-        self.assertTrue("11434" in cfg.llm.base_url)
+        self.assertEqual(cfg.asr.backend, "sherpa")
+        self.assertIn("sense-voice", cfg.asr.sherpa_model_dir)
+        self.assertIn("8000", cfg.llm.base_url)
+        self.assertEqual(cfg.llm.model, "Qwen3-VL-8B-Instruct-4bit")
         self.assertTrue(cfg.injector.enabled)
 
     def test_defaults_without_file(self) -> None:
@@ -52,6 +61,24 @@ class MultipartTests(unittest.TestCase):
         self.assertIn(b'filename="fake.wav"', body)
         self.assertIn(b"RIFFxxxxWAVEfmt ", body)
         self.assertTrue(body.endswith(f"--{boundary}--\r\n".encode()))
+
+
+@unittest.skipUnless(
+    HAS_SHERPA and (SENSE_VOICE_DIR / "model.int8.onnx").exists(),
+    "需要 sherpa-onnx 与本地 SenseVoice 模型",
+)
+class SherpaIntegrationTests(unittest.TestCase):
+    def test_sense_voice_transcribe(self) -> None:
+        from say2type.asr.sherpa_backend import SherpaAsr
+        from say2type.config import AsrConfig
+
+        cfg = AsrConfig(
+            sherpa_model_dir=str(SENSE_VOICE_DIR),
+            language="zh",
+        )
+        wav = SENSE_VOICE_DIR / "morning_scene.wav"
+        text = SherpaAsr(cfg).transcribe(wav)
+        self.assertIn("阳光", text)
 
 
 if __name__ == "__main__":

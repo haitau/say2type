@@ -17,6 +17,8 @@ Rime
 杰森=JSON
 jason=JSON
 docker=Docker
+Dockerfile
+dockerfile=Dockerfile
 k8s=Kubernetes
 K 8 s=Kubernetes
 库伯奈特斯=Kubernetes

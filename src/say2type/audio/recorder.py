@@ -140,6 +140,9 @@ class Recorder:
                 "-af",
                 f"silencedetect=n={self.cfg.silence_db}dB:d={self.cfg.silence_seconds}",
             ]
+        # 硬性时长上限：即使停止信号丢失（状态文件被误删等），ffmpeg 也会自动退出，
+        # 杜绝后台无限录音
+        cmd += ["-t", str(self.cfg.max_duration)]
         cmd += ["-c:a", "pcm_s16le", str(wav_path)]
         return cmd
 

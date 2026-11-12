@@ -86,11 +86,14 @@ class LlmCleaner:
                 {"role": "user", "content": raw_text},
             ],
         }
+        headers = {"Content-Type": "application/json"}
+        if self.cfg.api_key:
+            headers["Authorization"] = f"Bearer {self.cfg.api_key}"
         req = request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
         try:
             with request.urlopen(req, timeout=self.cfg.timeout) as resp:

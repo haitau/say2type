@@ -39,6 +39,17 @@ def process_wav(wav_path: Path, cfg: AppConfig, *, inject: bool = True) -> Pipel
 
     total_ms = int((time.perf_counter() - t_start) * 1000)
 
+    # 静音/噪声输入时 ASR 可能只回标点，避免把无意义字符注入光标
+    if not final_text.strip("。.，,！!？?；;：:、 \t\n\r"):
+        sys.stderr.write("[say2type] 未识别到有效语音内容，跳过注入\n")
+        return PipelineResult(
+            raw_text=raw_text,
+            final_text="",
+            asr_ms=asr_ms,
+            llm_ms=llm_ms,
+            total_ms=total_ms,
+        )
+
     if inject and cfg.injector.enabled and final_text:
         inject_paste(final_text, cfg.injector)
 
